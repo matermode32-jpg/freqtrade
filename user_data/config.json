@@ -44,12 +44,17 @@
         "enabled": true,
         "key": "",
         "secret": "",
+        "markets_refresh_interval": 60,
+        "ccxt_config": {
+            "enableRateLimit": true
+        },
+        "ccxt_async_config": {
+            "enableRateLimit": true
+        },
         "pair_whitelist": [
             "BTC/USDT",
             "ETH/USDT",
-            "BNB/USDT",
-            "SOL/USDT",
-            "XRP/USDT"
+            "BNB/USDT"
         ],
         "pair_blacklist": [
             "DOGE/USDT",
