@@ -9,6 +9,8 @@ import os
 import sys
 
 CONFIG_SRC = "/freqtrade/config.json"
+# Writable at runtime even when the image files are read-only / owned by another user.
+CONFIG_DST = "/tmp/freqtrade.config.json"
 
 PLACEHOLDER_MAP = {
     "your_token_here": os.environ.get("TELEGRAM_TOKEN", ""),
@@ -62,13 +64,30 @@ def main():
     if ex_secret:
         config.setdefault("exchange", {})["secret"] = ex_secret
 
-    with open(CONFIG_SRC, "w", encoding="utf-8") as f:
+    with open(CONFIG_DST, "w", encoding="utf-8") as f:
         json.dump(config, f, indent=4)
 
     print("entrypoint: config placeholders injected from env (values not logged).", flush=True)
 
-    # Hand over to freqtrade: `trade --config config.json --strategy SampleStrategy`
-    os.execvp("freqtrade", ["freqtrade"] + sys.argv[1:])
+    # Hand over to freqtrade, forcing --config to the writable runtime copy.
+    # CMD is: trade --config config.json --strategy SampleStrategy
+    args = sys.argv[1:]
+    out = []
+    skip_next = False
+    for i, a in enumerate(args):
+        if skip_next:
+            skip_next = False
+            continue
+        if a == "--config":
+            out += ["--config", CONFIG_DST]
+            skip_next = True
+        elif a.startswith("--config="):
+            out += ["--config=" + CONFIG_DST]
+        else:
+            out.append(a)
+    if "--config" not in args and not any(a.startswith("--config") for a in args):
+        out += ["--config", CONFIG_DST]
+    os.execvp("freqtrade", ["freqtrade"] + out)
 
 if __name__ == "__main__":
     main()
