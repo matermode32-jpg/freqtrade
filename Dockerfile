@@ -6,7 +6,5 @@ COPY --chown=freqtrade:freqtrade entrypoint.sh /freqtrade/entrypoint.sh
 COPY --chown=freqtrade:freqtrade user_data/config.json /freqtrade/config.json
 COPY --chown=freqtrade:freqtrade user_data/ /freqtrade/user_data/
 
-RUN chmod +x /freqtrade/entrypoint.sh
-
-ENTRYPOINT ["/freqtrade/entrypoint.sh"]
+ENTRYPOINT ["python3", "/freqtrade/entrypoint.sh"]
 CMD ["trade", "--config", "config.json", "--strategy", "SampleStrategy"]
