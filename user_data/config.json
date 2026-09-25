@@ -61,6 +61,11 @@
             "SHIB/USDT"
         ]
     },
+    "pairlists": [
+        {
+            "method": "StaticPairList"
+        }
+    ],
     "telegram": {
         "enabled": true,
         "token": "your_token_here",
