@@ -40,7 +40,7 @@
         }
     },
     "exchange": {
-        "name": "binance",
+        "name": "kraken",
         "enabled": true,
         "key": "",
         "secret": "",
@@ -54,7 +54,7 @@
         "pair_whitelist": [
             "BTC/USDT",
             "ETH/USDT",
-            "BNB/USDT"
+            "SOL/USDT"
         ],
         "pair_blacklist": [
             "DOGE/USDT",
