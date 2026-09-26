@@ -174,27 +174,39 @@ class ConfluenceStrategy(IStrategy):
     # ---- confluence entries (Neon confluence.py port) ----
 
     def populate_entry_trend(self, dataframe: pd.DataFrame, metadata: dict) -> pd.DataFrame:
+        # Neon-faithful SCORING (not hard AND): weights sum to 100, enter at >=55.
         dataframe["enter_long"] = 0
         dataframe["enter_tag"] = ""
 
-        cond_trend = dataframe["trend_up"] == True  # noqa: E712
-        cond_rsi = dataframe["rsi"] < 30
-        cond_vol = dataframe["volume"] > dataframe["vol_avg20"]
-        cond_struct = dataframe["bull_ob"] | dataframe["bull_fvg"]
+        w_trend, w_rsi, w_vol, w_struct = 30, 25, 15, 30
+        c_trend = (dataframe["trend_up"] == True).fillna(False)  # noqa: E712
+        c_rsi = (dataframe["rsi"] < 30).fillna(False)
+        c_vol = (dataframe["volume"] > dataframe["vol_avg20"]).fillna(False)
+        c_struct = (dataframe["bull_ob"] | dataframe["bull_fvg"]).fillna(False)
 
-        long_mask = reduce(lambda a, b: a & b,
-                           [cond_trend, cond_rsi, cond_vol, cond_struct]).fillna(False)
+        score = (c_trend.astype(int) * w_trend + c_rsi.astype(int) * w_rsi
+                 + c_vol.astype(int) * w_vol + c_struct.astype(int) * w_struct)
+        dataframe["confluence_score"] = score
+        long_mask = score >= 55
 
         dataframe.loc[long_mask, "enter_long"] = 1
-        for idx in dataframe.index[long_mask.fillna(False)]:
+        for idx in dataframe.index[long_mask]:
             row = dataframe.loc[idx]
+            conds = []
+            if row.get("trend_up") is True or bool(c_trend.loc[idx]):
+                conds.append("trend")
+            if bool(c_rsi.loc[idx]):
+                conds.append("rsi")
+            if bool(c_vol.loc[idx]):
+                conds.append("volume")
+            if bool(c_struct.loc[idx]):
+                conds.append("structure")
             dataframe.at[idx, "enter_tag"] = _json_snapshot({
-                "trend": "up",
+                "score": int(score.loc[idx]),
                 "rsi": row.get("rsi"),
                 "vol": row.get("volume"),
-                "vol_avg20": row.get("vol_avg20"),
                 "atr": row.get("atr"),
-                "conds": ["trend", "rsi", "volume", "structure"],
+                "conds": conds,
             })[:200]
         return dataframe
 
