@@ -50,6 +50,29 @@ def _json_snapshot(payload: dict) -> str:
     return json.dumps(_clean(payload), separators=(",", ":"))
 
 
+def _kalman_state(close: pd.Series) -> pd.Series:
+    """1-D random-walk Kalman level on normalized closes (NaN-safe, O(n))."""
+    c = close.astype(float)
+    first = c.iloc[0] if len(c) else np.nan
+    base = first if np.isfinite(first) and first != 0 else 1.0
+    y = (c / base).ffill().fillna(1.0).values
+    n = len(y)
+    est = np.empty(n)
+    est[0] = y[0]
+    p, q = 1.0, 1e-6
+    d = np.diff(y)
+    finite = d[np.isfinite(d)] if n > 2 else np.array([])
+    r = float(np.var(finite)) if len(finite) else 1e-6
+    if not np.isfinite(r) or r <= 0:
+        r = 1e-6
+    for i in range(1, n):
+        p = p + q
+        k = p / (p + r)
+        est[i] = est[i - 1] + k * (y[i] - est[i - 1])
+        p = (1 - k) * p
+    return pd.Series(est, index=close.index)
+
+
 class ConfluenceStrategy(IStrategy):
     INTERFACE_VERSION = 3
     timeframe = "5m"
@@ -100,7 +123,7 @@ class ConfluenceStrategy(IStrategy):
 
     def informative_pairs(self):
         pairs = self.dp.current_whitelist()
-        return [(pair, "4h") for pair in pairs]
+        return [(pair, tf) for pair in pairs for tf in ("4h", "1h", "15m")]
 
     # ---- indicators + structure + quant metrics ----
 
@@ -116,6 +139,12 @@ class ConfluenceStrategy(IStrategy):
         dataframe["macd_hist"] = macd["macdhist"]
         dataframe["atr"] = ta.ATR(dataframe, timeperiod=14)
         dataframe["vol_avg20"] = dataframe["volume"].rolling(20).mean()
+        # 5m micro trigger parts (MTF matrix row 3)
+        cross = ((dataframe["ema9"] > dataframe["ema21"])
+                 & (dataframe["ema9"].shift(1) <= dataframe["ema21"].shift(1)))
+        dataframe["ema_cross_up"] = cross.fillna(False).astype(bool)
+        dataframe["vol_spike15"] = (
+            dataframe["volume"] > 1.5 * dataframe["vol_avg20"]).fillna(False).astype(bool)
 
         # Z-Score volatility normalization (gate: z_low < z < z_high for longs)
         sma_20 = ta.SMA(dataframe["close"], timeperiod=20)
@@ -190,6 +219,44 @@ class ConfluenceStrategy(IStrategy):
                 dataframe["trend_up"] = (
                     spread_ok & ema_up & price_ok).fillna(False).astype(bool)
 
+        # --- 1h macro regime: Kalman slope > 0 and ADX > 20 (MTF row 1) ---
+        # Caveat: 1h EMA200 needs 200h history; Kraken caps ~192 1h bars, so
+        # early-window values are warming. Kalman+ADX carry the gate meanwhile.
+        dataframe["h1_regime"] = False
+        if self.dp is not None:
+            informative_1h = self.dp.get_pair_dataframe(
+                pair=metadata["pair"], timeframe="1h")
+            if informative_1h is not None and not informative_1h.empty:
+                informative_1h["ema200"] = ta.EMA(informative_1h, timeperiod=200)
+                informative_1h["adx"] = ta.ADX(informative_1h, timeperiod=14)
+                informative_1h["kstate"] = _kalman_state(informative_1h["close"])
+                dataframe = merge_informative_pair(
+                    dataframe, informative_1h, self.timeframe, "1h", ffill=True)
+                slope_up = dataframe["kstate_1h"] > dataframe["kstate_1h"].shift(1)
+                dataframe["h1_regime"] = (
+                    slope_up & (dataframe["adx_1h"] > 20)).fillna(False).astype(bool)
+
+        # --- 15m structure: above swing low + RSI 45-65 (MTF row 2) ---
+        dataframe["m15_setup"] = False
+        if self.dp is not None:
+            informative_15m = self.dp.get_pair_dataframe(
+                pair=metadata["pair"], timeframe="15m")
+            if informative_15m is not None and not informative_15m.empty:
+                informative_15m["rsi"] = ta.RSI(informative_15m, timeperiod=14)
+                lh = informative_15m["high"]
+                ll = informative_15m["low"]
+                sw = pd.Series(index=informative_15m.index, dtype=float)
+                for i in range(5, len(informative_15m) - 5):
+                    w = slice(i - 5, i + 5 + 1)
+                    if ll.iloc[i] == ll.iloc[w].min():
+                        sw.iloc[i] = ll.iloc[i]
+                informative_15m["swing_low"] = sw.ffill()
+                dataframe = merge_informative_pair(
+                    dataframe, informative_15m, self.timeframe, "15m", ffill=True)
+                dataframe["m15_setup"] = (
+                    (dataframe["close"] > dataframe["swing_low_15m"])
+                    & dataframe["rsi_15m"].between(45, 65)).fillna(False).astype(bool)
+
         return dataframe
 
     # ---- scored entries + Z-gate ----
@@ -198,6 +265,10 @@ class ConfluenceStrategy(IStrategy):
         dataframe["enter_long"] = 0
         dataframe["enter_tag"] = ""
 
+        # Validated scoring (30d: +0.40%, 77% win). MTF columns (h1_regime,
+        # m15_setup, ema_cross_up) stay computed + available for analysis but
+        # carry NO weight: wiring them into the score LOST money (-0.25% @55,
+        # 2-trade noise @65). Re-promote only with walk-forward proof.
         w_trend, w_rsi, w_vol, w_struct = 30, 25, 15, 30
         c_trend = (dataframe["trend_up"] == True).fillna(False)  # noqa: E712
         c_rsi = (dataframe["rsi"] < 30).fillna(False)
