@@ -102,7 +102,7 @@
         "process_throttle_secs": 5
     },
     "timeframe": "5m",
-    "strategy": "SampleStrategy",
+    "strategy": "ConfluenceStrategy",
     "strategy_path": "/freqtrade/user_data/strategies/",
     "db_url": "sqlite:////freqtrade/user_data/tradesv3.sqlite",
     "user_data_dir": "/freqtrade/user_data",
