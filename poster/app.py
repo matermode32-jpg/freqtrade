@@ -334,7 +334,7 @@ def _kraken_pair(pair: str) -> str | None:
         return None
 
 
-def fetch_ohlc(pair: str, limit: int = 300) -> list:
+def fetch_ohlc(pair: str, limit: int = 130) -> list:
     kp = _kraken_pair(pair)
     if not kp:
         raise ValueError("unmappable pair")
@@ -348,28 +348,45 @@ def fetch_ohlc(pair: str, limit: int = 300) -> list:
     result = body.get("result", {})
     key = next((k for k in result.keys() if k != "last"), None)
     rows = result.get(key, []) if key else []
-    out = [[float(c[1]), float(c[2]), float(c[3]), float(c[4]), float(c[6])]
-           for c in rows[-limit:] if len(c) > 6]
+    # [time, o, h, l, c, v] — last ~10h only: 300 crammed bars were mush
+    out = [[int(c[0]), float(c[1]), float(c[2]), float(c[3]), float(c[4]),
+            float(c[6])] for c in rows[-limit:] if len(c) > 6]
     if len(out) < 60:
         raise ValueError("too few candles")
     return out
 
 
 def render_chart(ohlc: list, snap: dict, out_path: str = "/tmp/chart.png") -> str:
-    """1200x675 candlesticks; overlays ONLY for conditions_fired (≤3):
-    trend->EMA50, volume->volume bars, structure/rsi->nothing plotted."""
+    """1200x675 candlesticks, last ~10h. Y-axis fits CANDLES (padded);
+    target/stop draw only inside the view, else edge arrows. (Old version let
+    the fixed +/-10% bands squash everything flat, and 300 bars were mush.)
+    Overlays ONLY for conditions_fired (<=3): trend->EMA50, volume->bars."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     import matplotlib.patches as patches
+    from datetime import datetime as _dt
     conds = set(snap.get("conditions_fired", []) or [])
-    closes = [c[3] for c in ohlc]
+    times = [_dt.fromtimestamp(c[0], tz=timezone.utc).strftime("%H:%M") for c in ohlc]
+    opens = [c[1] for c in ohlc]
+    highs = [c[2] for c in ohlc]
+    lows = [c[3] for c in ohlc]
+    closes = [c[4] for c in ohlc]
+    vols = [c[5] for c in ohlc]
+
+    lo, hi = min(lows), max(highs)
+    pad = (hi - lo) * 0.15 or hi * 0.001
+    lo -= pad
+    hi += pad
+
     fig, ax = plt.subplots(figsize=(12, 6.75), dpi=100)
-    for i, (o, h, low, c, _v) in enumerate(ohlc):
-        color = "green" if c >= o else "red"
-        ax.plot([i, i], [low, h], color=color, linewidth=0.8)
+    ax.set_facecolor("#0f1115")
+    fig.patch.set_facecolor("#0f1115")
+    for i, (o, h, l, c) in enumerate(zip(opens, highs, lows, closes)):
+        color = "#26a69a" if c >= o else "#ef5350"
+        ax.plot([i, i], [l, h], color=color, linewidth=1.2)
         ax.add_patch(patches.Rectangle(
-            (i - 0.35, min(o, c)), 0.7, max(abs(c - o), 1e-9),
+            (i - 0.35, min(o, c)), 0.7, max(abs(c - o), (hi - lo) * 0.0008),
             facecolor=color, edgecolor=color))
     n_over = 0
     if "trend" in conds and n_over < 3:
@@ -377,20 +394,47 @@ def render_chart(ohlc: list, snap: dict, out_path: str = "/tmp/chart.png") -> st
         for v in closes:
             s = v * k + s * (1 - k)
             ema.append(s)
-        ax.plot(ema, label="EMA50", linewidth=1.2)
+        ax.plot(ema, label="EMA50", linewidth=1.4, color="#e2a63d")
         n_over += 1
     entry = snap.get("entry_price") or 0
+
+    def _level(price: float, style: str, label: str, color: str) -> None:
+        if not price:
+            return
+        if lo <= price <= hi:
+            ax.axhline(price, linestyle=style, linewidth=1.2, color=color)
+            ax.text(len(ohlc) - 1, price, " %s %s " % (label, _fmt(price)),
+                    color="white", fontsize=9, va="center", ha="right",
+                    bbox=dict(facecolor=color, alpha=0.85, edgecolor="none", pad=1))
+        else:
+            arrow = "$\u2191$" if price > hi else "$\u2193$"
+            ax.annotate("%s %s %s" % (label, arrow, _fmt(price)),
+                        xy=(len(ohlc) - 1, hi if price > hi else lo),
+                        color=color, fontsize=10, ha="right",
+                        va="top" if price > hi else "bottom")
+
     if entry:
-        ax.axhline(entry, linestyle="--", label="entry")
-        ax.axhline(entry * 1.04, linestyle=":", label="target")
-        ax.axhline(entry * 0.90, linestyle=":", label="stop")
+        _level(entry, "--", "entry", "#4da3ff")
+        _level(entry * 1.04, ":", "target", "#26a69a")
+        _level(entry * 0.90, ":", "stop", "#ef5350")
     if "volume" in conds and n_over < 3:
         ax2 = ax.twinx()
-        ax2.bar(range(len(ohlc)), [c[4] for c in ohlc], alpha=0.25)
+        ax2.bar(range(len(ohlc)), vols, alpha=0.22, color="gray")
+        ax2.set_ylim(0, max(vols) * 4)
+        ax2.tick_params(labelsize=7, colors="gray")
         n_over += 1
-    ax.set_title("%s - 5m (paper)" % snap.get("coin", "?"), loc="left")
-    ax.legend(fontsize=8)
-    fig.savefig(out_path, bbox_inches="tight")
+    step = max(1, len(ohlc) // 6)
+    ax.set_xticks(range(0, len(ohlc), step))
+    ax.set_xticklabels([times[i] for i in range(0, len(ohlc), step)],
+                       fontsize=8, color="gray")
+    ax.set_xlim(-1, len(ohlc))
+    ax.set_ylim(lo, hi)
+    ax.tick_params(labelsize=8, colors="gray")
+    ax.grid(True, alpha=0.15)
+    ax.set_title("%s - 5m (paper)" % snap.get("coin", "?"), loc="left",
+                 color="white", fontsize=12)
+    ax.legend(fontsize=8, facecolor="#0f1115", labelcolor="white")
+    fig.savefig(out_path, bbox_inches="tight", facecolor=fig.get_facecolor())
     plt.close(fig)
     return out_path
 
