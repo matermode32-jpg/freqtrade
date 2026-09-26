@@ -74,6 +74,33 @@
             "method": "StaticPairList"
         }
     ],
+    "webhook": {
+        "enabled": true,
+        "url": "your_poster_url_here",
+        "format": "json",
+        "retries": 2,
+        "retry_delay": 0.5,
+        "timeout": 10,
+        "entry_fill": {
+            "event": "entry_fill",
+            "pair": "{pair}",
+            "direction": "{direction}",
+            "rate": "{open_rate}",
+            "stake": "{stake_amount}",
+            "tag": "{enter_tag}",
+            "trade_id": "{trade_id}"
+        },
+        "exit_fill": {
+            "event": "exit_fill",
+            "pair": "{pair}",
+            "direction": "{direction}",
+            "close_rate": "{close_rate}",
+            "profit_ratio": "{profit_ratio}",
+            "profit_amount": "{profit_amount}",
+            "tag": "{enter_tag}",
+            "trade_id": "{trade_id}"
+        }
+    },
     "telegram": {
         "enabled": true,
         "token": "your_token_here",
