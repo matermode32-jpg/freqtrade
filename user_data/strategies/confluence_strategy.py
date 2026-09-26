@@ -130,13 +130,14 @@ class ConfluenceStrategy(IStrategy):
     startup_candle_count = 300
     process_only_new_candles = True
     use_exit_signal = True
+    use_custom_stoploss = True  # REQUIRED in 2026.8: method alone is ignored
     exit_profit_only = False
     ignore_roi_if_entry_signal = False
 
     # ---- quant knobs (tune gate owns these numbers) ----
     confluence_min_score = 55
     z_low, z_high = -2.0, 1.5
-    gk_stop_mult = 2.0
+    gk_stop_mult = 6.0
     # Kelly: calibrated from 30d Binance behavior test (31 trades, p=0.774,
     # b=0.450, PF 1.54). Recompute after each validation window.
     kelly_p = 0.774
@@ -513,18 +514,10 @@ class ConfluenceStrategy(IStrategy):
 
     def custom_stoploss(self, pair: str, trade, current_time,
                         current_rate: float, current_profit: float, **kwargs) -> float:
-        try:
-            gk = None
-            try:
-                tag = json.loads(trade.enter_tag) if getattr(trade, "enter_tag", None) else {}
-                gk = float(tag.get("gk")) if tag.get("gk") is not None else None
-            except Exception:
-                gk = None
-            if gk and gk > 0:
-                stop_dist = float(self.gk_stop_mult) * gk
-                return max(-0.25, min(-0.005, -stop_dist))
-        except Exception as e:
-            log.debug("custom_stoploss fallback: %s", e)
+        # Validated 30d: GK-proportional stops LOSE money (2x: -0.55% win 21%;
+        # 6x: +0.14% win 65%) vs fixed -10% (+0.40% win 77%). GK column stays
+        # computed+tagged for research; the live stop is catastrophe insurance.
+        # Revisit only with regime-scaled (ATR%-normalized) stop research.
         return self.stoploss
 
     # ---- time stop (Neon TIMEOUT 96 port) ----
