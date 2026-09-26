@@ -60,6 +60,8 @@ class ConfluenceStrategy(IStrategy):
     use_exit_signal = True
     exit_profit_only = False
     ignore_roi_if_entry_signal = False
+    # Tune gate: entry threshold sweep 45/55/65 on 30d Binance behavior data.
+    confluence_min_score = 55
 
     # Neon daily-loss guard port (freqtrade 2026: protections live in the
     # strategy, config-level 'protections' is deprecated).
@@ -187,7 +189,7 @@ class ConfluenceStrategy(IStrategy):
         score = (c_trend.astype(int) * w_trend + c_rsi.astype(int) * w_rsi
                  + c_vol.astype(int) * w_vol + c_struct.astype(int) * w_struct)
         dataframe["confluence_score"] = score
-        long_mask = score >= 55
+        long_mask = score >= int(getattr(self, "confluence_min_score", 55))
 
         dataframe.loc[long_mask, "enter_long"] = 1
         for idx in dataframe.index[long_mask]:
