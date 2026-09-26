@@ -73,6 +73,54 @@ def _kalman_state(close: pd.Series) -> pd.Series:
     return pd.Series(est, index=close.index)
 
 
+def _rolling_hurst(close: pd.Series, window: int = 100, max_lag: int = 20) -> pd.Series:
+    """Rolling Hurst exponent (analysis only, zero weight until proven).
+    H > 0.55 trending, 0.45-0.55 noise. O(n*window) python loop: fine for
+    live/backtest cadence, expensive for hyperopt grids (don't grid it)."""
+    vals = close.astype(float).values
+    n = len(vals)
+    out = np.full(n, np.nan)
+    lags = np.arange(2, max_lag)
+    log_lags = np.log(lags)
+    for i in range(window, n):
+        seg = vals[i - window:i]
+        if not np.all(np.isfinite(seg)):
+            continue
+        tau = []
+        ok = True
+        for lag in lags:
+            s = np.std(seg[lag:] - seg[:-lag])
+            if not np.isfinite(s) or s <= 0:
+                ok = False
+                break
+            tau.append(np.sqrt(s))
+        if not ok:
+            continue
+        slope = np.polyfit(log_lags, np.log(tau), 1)[0]
+        out[i] = slope * 2.0
+    return pd.Series(out, index=close.index)
+
+
+def _append_ledger(path: str, row: dict, max_bytes: int) -> None:
+    """Append-only signal ledger (ignored by git). Rotates once past cap."""
+    import csv
+    import os as _os
+    try:
+        d = _os.path.dirname(path)
+        if d:
+            _os.makedirs(d, exist_ok=True)
+        if _os.path.exists(path) and _os.path.getsize(path) > max_bytes:
+            _os.replace(path, path + ".bak")
+        new = not _os.path.exists(path)
+        with open(path, "a", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=list(row.keys()))
+            if new:
+                w.writeheader()
+            w.writerow(row)
+    except Exception as e:
+        log.debug("ledger skip: %s", e)
+
+
 class ConfluenceStrategy(IStrategy):
     INTERFACE_VERSION = 3
     timeframe = "5m"
@@ -96,7 +144,14 @@ class ConfluenceStrategy(IStrategy):
     kelly_lambda = 0.25
     kelly_min_stake = 20.0
     kelly_max_stake = 300.0
-    veto_timeout_s = 1.2
+    # GPT OSS 120B via Groq is slower than 8b-instant: 2.5s budget. Signals are
+    # rare (~1/day live) so the loop-block is harmless; fail-open still guards.
+    veto_timeout_s = 2.5
+    veto_model_default = "openai/gpt-oss-120b"
+    ledger_path = "user_data/logs/signal_ledger.csv"
+    ledger_max_bytes = 2_000_000
+    hurst_window = 100
+    hurst_max_lag = 20
 
     protections = [
         {
@@ -156,6 +211,12 @@ class ConfluenceStrategy(IStrategy):
         log_co = np.log(dataframe["close"] / dataframe["open"].replace(0, np.nan))
         gk_var = 0.5 * (log_hl ** 2) - (2 * np.log(2) - 1) * (log_co ** 2)
         dataframe["garman_klass"] = np.sqrt(np.maximum(gk_var.fillna(0), 0))
+
+        # Rolling Hurst (analysis only: computed, tagged, never scored).
+        dataframe["hurst_100"] = _rolling_hurst(
+            dataframe["close"],
+            window=int(getattr(self, "hurst_window", 100)),
+            max_lag=int(getattr(self, "hurst_max_lag", 20)))
 
         # --- structure: swings / order blocks / FVG (closed candles only) ---
         lookback = 5
@@ -298,6 +359,7 @@ class ConfluenceStrategy(IStrategy):
                 "score": int(score.loc[idx]),
                 "z": row.get("z_score"),
                 "gk": row.get("garman_klass"),
+                "h": row.get("hurst_100"),
                 "conds": conds,
             })[:200]
         return dataframe
@@ -377,17 +439,36 @@ class ConfluenceStrategy(IStrategy):
     def confirm_trade_entry(self, pair: str, order_type: str, amount: float, rate: float,
                             time_in_force: str, current_time: datetime, entry_tag: str | None,
                             side: str, **kwargs) -> bool:
+        import time as _time
+
+        def _ledger(verdict: bool, why: str, latency_ms: float) -> None:
+            _append_ledger(
+                getattr(self, "ledger_path", "user_data/logs/signal_ledger.csv"),
+                {"time_utc": current_time.isoformat() if hasattr(current_time, "isoformat")
+                 else str(current_time),
+                 "pair": pair, "rate": rate, "amount": amount, "tag": entry_tag or "",
+                 "verdict": "approve" if verdict else "veto", "why": why,
+                 "model": os.getenv("GROQ_MODEL", getattr(
+                     self, "veto_model_default", "openai/gpt-oss-120b")),
+                 "prompt_version": VETO_PROMPT_VERSION,
+                 "latency_ms": round(latency_ms, 1)},
+                int(getattr(self, "ledger_max_bytes", 2_000_000)))
+
+        t0 = _time.monotonic()
         try:
             key = os.getenv("GROQ_API_KEY", "")
             if not key:
+                _ledger(True, "no_key", 0.0)
                 return True  # no key configured (local/backtest): approve silently
-            model = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+            model = os.getenv("GROQ_MODEL", getattr(
+                self, "veto_model_default", "openai/gpt-oss-120b"))
             try:
                 signal_data = json.loads(entry_tag) if entry_tag else {}
             except Exception:
                 signal_data = {}
             cache_key = (pair, json.dumps(signal_data, sort_keys=True, default=str))
             if cache_key in self._veto_cache:
+                _ledger(self._veto_cache[cache_key], "cached", 0.0)
                 return self._veto_cache[cache_key]
             prompt_content = {
                 "prompt_version": VETO_PROMPT_VERSION,
@@ -420,9 +501,12 @@ class ConfluenceStrategy(IStrategy):
             if len(self._veto_cache) >= VETO_CACHE_MAX:
                 self._veto_cache.clear()
             self._veto_cache[cache_key] = verdict
+            _ledger(verdict, "groq:%d" % r.status_code,
+                    (_time.monotonic() - t0) * 1000)
             return verdict
         except Exception as e:
             log.debug("veto fail-open (%s) [%s]", e, VETO_PROMPT_VERSION)
+            _ledger(True, "fail_open", (_time.monotonic() - t0) * 1000)
             return True
 
     # ---- Garman-Klass stop frozen at entry ----
