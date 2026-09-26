@@ -9,31 +9,39 @@
     "cancel_open_orders_on_exit": false,
     "trading_mode": "spot",
     "margin_mode": null,
+    "order_types": {
+        "entry": "limit",
+        "exit": "limit",
+        "emergency_exit": "market",
+        "force_entry": "limit",
+        "force_exit": "limit",
+        "stoploss": "market",
+        "stoploss_on_exchange": true,
+        "stoploss_on_exchange_interval": 60
+    },
     "unfilledtimeout": {
-        "entry": 10,
-        "exit": 10,
+        "entry": 15,
+        "exit": 15,
         "exit_timeout_count": 0,
         "unit": "minutes"
     },
     "entry_pricing": {
-        "price_side": "same",
-        "use_order_book": false,
-        "order_book_min": 1,
-        "order_book_max": 1,
+        "price_side": "bid",
+        "post_only": true,
+        "use_order_book": true,
+        "order_book_top": 1,
         "price_last_balance": 0.0,
-        "use_order_book_timeframe": null,
         "check_depth_of_market": {
             "enabled": false,
             "bids_to_ask_delta": 1
         }
     },
     "exit_pricing": {
-        "price_side": "same",
-        "use_order_book": false,
-        "order_book_min": 1,
-        "order_book_max": 1,
+        "price_side": "ask",
+        "post_only": true,
+        "use_order_book": true,
+        "order_book_top": 1,
         "price_last_balance": 0.0,
-        "use_order_book_timeframe": null,
         "check_depth_of_market": {
             "enabled": false,
             "bids_to_ask_delta": 1

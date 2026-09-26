@@ -1,27 +1,24 @@
-# ConfluenceStrategy — Neon port skeleton (branch only, NOT live).
-# Live bot on main still runs SampleStrategy; Render tracks main, so this file
-# changes nothing until merged + validated. Validate: list-strategies, backtest.
+# ConfluenceStrategy — quant upgrade (branch quant-upgrade, NOT live).
+# Merges: Neon port base + spec upgrades (maker pricing, Z-score, Garman-Klass
+# stops, Groq veto, Kelly sizing). Live bot on main still runs the pre-quant
+# version until this branch is validated + merged.
 #
-# Ported from Neon Trade analysis/ with review fixes baked in:
-#  - FVG filled-check (structure FVG had none) and OB scan on rolling ATR
-#    (Neon used current ATR for all history).
-#  - enter_tag is real JSON via json.dumps with NaN->null (Neon used str(list)).
-#  - ATR stop frozen at entry via trade.custom_data (Neon lesson: snapshot, don't breathe).
-#  - Time stop ~96x5m via custom_exit (Neon's TIMEOUT port).
-#  - Protections (StoplossGuard/MaxDrawdown, Neon's daily-loss idea) live in
-#    config.json on this branch, NOT in this file.
-#  - confirm_trade_entry is a veto stub returning True. Groq wiring comes later
-#    with: hard timeout, fail-open default, verdict cache per signal hash.
-# Data note: 4h EMA200 needs ~33 days of 4h history. Our 7d Kraken window only
-# validates plumbing (expect few/zero gated trades); download 40d+ of 4h
-# (dl-trades, slow) before trusting bias-gated backtests.
+# Design log (review flags resolved here):
+#  - GK sqrt clipped (was NaN-prone); Hurst DEFERRED (needs rolling impl);
+#  - margin_mode stays null (spot); config is source of truth (no CLI override);
+#  - protections live in-strategy (2026.8); enter_tag real JSON, NaN-safe;
+#  - Groq key via os.getenv (no config-schema risk); veto fail-open, cached;
+#  - Kelly needs custom_stake_amount (formula alone sizes nothing).
 
 import json
 import logging
-from functools import reduce
+import os
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
+import requests
+from freqtrade.persistence import Trade
 from freqtrade.strategy import IStrategy, merge_informative_pair
 
 try:
@@ -31,12 +28,14 @@ except ImportError:  # pragma: no cover - freqtrade image always has talib
 
 log = logging.getLogger(__name__)
 
-TIMEFRAME_4H_CANDLES_FOR_EMA200 = 200
-TIME_STOP_CANDLES = 96  # Neon max_hold_candles port (96 x 5m = 8h)
+TIME_STOP_CANDLES = 96  # 96 x 5m = 8h (Neon TIMEOUT port)
+VETO_PROMPT_VERSION = "v1-quant"
+VETO_CACHE_MAX = 500
 
 
 def _json_snapshot(payload: dict) -> str:
     """JSON-safe snapshot: NaN/inf -> null, compact, rounded floats."""
+
     def _clean(v):
         if isinstance(v, float):
             if np.isnan(v) or np.isinf(v):
@@ -52,7 +51,9 @@ def _json_snapshot(payload: dict) -> str:
 
 
 class ConfluenceStrategy(IStrategy):
+    INTERFACE_VERSION = 3
     timeframe = "5m"
+    can_short = False
     minimal_roi = {"60": 0.01, "30": 0.02, "0": 0.04}
     stoploss = -0.10
     startup_candle_count = 300
@@ -60,11 +61,20 @@ class ConfluenceStrategy(IStrategy):
     use_exit_signal = True
     exit_profit_only = False
     ignore_roi_if_entry_signal = False
-    # Tune gate: entry threshold sweep 45/55/65 on 30d Binance behavior data.
-    confluence_min_score = 55
 
-    # Neon daily-loss guard port (freqtrade 2026: protections live in the
-    # strategy, config-level 'protections' is deprecated).
+    # ---- quant knobs (tune gate owns these numbers) ----
+    confluence_min_score = 55
+    z_low, z_high = -2.0, 1.5
+    gk_stop_mult = 2.0
+    # Kelly: calibrated from 30d Binance behavior test (31 trades, p=0.774,
+    # b=0.450, PF 1.54). Recompute after each validation window.
+    kelly_p = 0.774
+    kelly_b = 0.450
+    kelly_lambda = 0.25
+    kelly_min_stake = 20.0
+    kelly_max_stake = 300.0
+    veto_timeout_s = 1.2
+
     protections = [
         {
             "method": "StoplossGuard",
@@ -78,17 +88,21 @@ class ConfluenceStrategy(IStrategy):
             "lookback_period_candles": 288,  # 288 x 5m = 24h
             "trade_limit": 10,
             "stop_duration_candles": 48,
-            "max_allowed_drawdown": 0.03,  # ~Neon 3%/day idea
+            "max_allowed_drawdown": 0.03,
         },
     ]
 
-    # ---- 4h trend bias (Neon trend_bias.py port) ----
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._veto_cache: dict = {}
+
+    # ---- 4h trend bias ----
 
     def informative_pairs(self):
         pairs = self.dp.current_whitelist()
         return [(pair, "4h") for pair in pairs]
 
-    # ---- indicators + structure (Neon indicators.py/structure.py port) ----
+    # ---- indicators + structure + quant metrics ----
 
     def populate_indicators(self, dataframe: pd.DataFrame, metadata: dict) -> pd.DataFrame:
         if ta is None:
@@ -103,11 +117,21 @@ class ConfluenceStrategy(IStrategy):
         dataframe["atr"] = ta.ATR(dataframe, timeperiod=14)
         dataframe["vol_avg20"] = dataframe["volume"].rolling(20).mean()
 
+        # Z-Score volatility normalization (gate: z_low < z < z_high for longs)
+        sma_20 = ta.SMA(dataframe["close"], timeperiod=20)
+        std_20 = dataframe["close"].rolling(20).std()
+        dataframe["z_score"] = (dataframe["close"] - sma_20) / std_20.replace(0, np.nan)
+
+        # Garman-Klass volatility (clipped: raw c1-c2 can go negative -> NaN)
+        log_hl = np.log(dataframe["high"] / dataframe["low"].replace(0, np.nan))
+        log_co = np.log(dataframe["close"] / dataframe["open"].replace(0, np.nan))
+        gk_var = 0.5 * (log_hl ** 2) - (2 * np.log(2) - 1) * (log_co ** 2)
+        dataframe["garman_klass"] = np.sqrt(np.maximum(gk_var.fillna(0), 0))
+
         # --- structure: swings / order blocks / FVG (closed candles only) ---
         lookback = 5
         highs = dataframe["high"]
         lows = dataframe["low"]
-        # last fractal swing high/low
         swing_high = pd.Series(index=dataframe.index, dtype=float)
         swing_low = pd.Series(index=dataframe.index, dtype=float)
         for i in range(lookback, len(dataframe) - lookback):
@@ -119,7 +143,6 @@ class ConfluenceStrategy(IStrategy):
         dataframe["swing_high"] = swing_high.ffill()
         dataframe["swing_low"] = swing_low.ffill()
 
-        # rolling ATR snapshot per candle (FIX vs Neon: no current-ATR-for-history)
         atr_roll = dataframe["atr"]
         body_bull = dataframe["close"] > dataframe["open"]
         body_bear = dataframe["close"] < dataframe["open"]
@@ -130,14 +153,10 @@ class ConfluenceStrategy(IStrategy):
         dataframe["bull_ob"] = (impulse & body_bull & prev_bear).astype(bool)
         dataframe["bear_ob"] = (impulse & body_bear & prev_bull).astype(bool)
 
-        # FVG with fill check (FIX vs Neon: filled gaps are forgotten)
         fvg_bull_raw = dataframe["low"] > highs.shift(2)
         fvg_bear_raw = dataframe["high"] < lows.shift(2)
-        gap_top_bull = dataframe["low"]
         gap_bot_bull = highs.shift(2)
         gap_top_bear = lows.shift(2)
-        gap_bot_bear = dataframe["high"]
-        # filled if any later low/high traded through the gap
         filled_bull = pd.Series(False, index=dataframe.index)
         filled_bear = pd.Series(False, index=dataframe.index)
         for i in dataframe.index[fvg_bull_raw.fillna(False)]:
@@ -151,13 +170,13 @@ class ConfluenceStrategy(IStrategy):
         dataframe["bull_fvg"] = (fvg_bull_raw.fillna(False) & ~filled_bull).astype(bool)
         dataframe["bear_fvg"] = (fvg_bear_raw.fillna(False) & ~filled_bear).astype(bool)
 
-        # --- 4h informative bias merge (Neon BiasTable port) ---
+        # --- 4h informative bias merge ---
         dataframe["trend_up"] = False
         if self.dp is not None:
             informative_4h = self.dp.get_pair_dataframe(
                 pair=metadata["pair"], timeframe="4h")
             if informative_4h is not None and not informative_4h.empty:
-                # plain names here: merge_informative_pair appends _4h itself
+                # plain names: merge_informative_pair appends _4h itself
                 informative_4h["ema50"] = ta.EMA(informative_4h, timeperiod=50)
                 informative_4h["ema200"] = ta.EMA(informative_4h, timeperiod=200)
                 dataframe = merge_informative_pair(
@@ -173,10 +192,9 @@ class ConfluenceStrategy(IStrategy):
 
         return dataframe
 
-    # ---- confluence entries (Neon confluence.py port) ----
+    # ---- scored entries + Z-gate ----
 
     def populate_entry_trend(self, dataframe: pd.DataFrame, metadata: dict) -> pd.DataFrame:
-        # Neon-faithful SCORING (not hard AND): weights sum to 100, enter at >=55.
         dataframe["enter_long"] = 0
         dataframe["enter_tag"] = ""
 
@@ -189,13 +207,15 @@ class ConfluenceStrategy(IStrategy):
         score = (c_trend.astype(int) * w_trend + c_rsi.astype(int) * w_rsi
                  + c_vol.astype(int) * w_vol + c_struct.astype(int) * w_struct)
         dataframe["confluence_score"] = score
-        long_mask = score >= int(getattr(self, "confluence_min_score", 55))
+        z = dataframe["z_score"]
+        z_ok = ((z > self.z_low) & (z < self.z_high)).fillna(False)
+        long_mask = (score >= int(getattr(self, "confluence_min_score", 55))) & z_ok
 
         dataframe.loc[long_mask, "enter_long"] = 1
         for idx in dataframe.index[long_mask]:
             row = dataframe.loc[idx]
             conds = []
-            if row.get("trend_up") is True or bool(c_trend.loc[idx]):
+            if bool(c_trend.loc[idx]):
                 conds.append("trend")
             if bool(c_rsi.loc[idx]):
                 conds.append("rsi")
@@ -205,9 +225,8 @@ class ConfluenceStrategy(IStrategy):
                 conds.append("structure")
             dataframe.at[idx, "enter_tag"] = _json_snapshot({
                 "score": int(score.loc[idx]),
-                "rsi": row.get("rsi"),
-                "vol": row.get("volume"),
-                "atr": row.get("atr"),
+                "z": row.get("z_score"),
+                "gk": row.get("garman_klass"),
                 "conds": conds,
             })[:200]
         return dataframe
@@ -217,32 +236,138 @@ class ConfluenceStrategy(IStrategy):
         dataframe.loc[dataframe["rsi"] > 70, "exit_long"] = 1
         return dataframe
 
-    # ---- master-engine veto (stub True; Groq wiring later) ----
+    # ---- maker execution callbacks (live/dry only; no-op in backtests) ----
+
+    def custom_entry_price(self, pair: str, current_time: datetime, proposed_rate: float,
+                           entry_tag: str, side: str, **kwargs) -> float:
+        try:
+            ob = self.dp.market_to_orderbook(pair, 1) if self.dp else None
+            if ob and ob.get("bids") and ob.get("asks"):
+                bid, ask = ob["bids"][0][0], ob["asks"][0][0]
+                if (ask - bid) / bid > 0.0008:
+                    return proposed_rate  # wide spread: fall back, post_only guards
+                return bid + (ask - bid) * 0.10
+        except Exception as e:
+            log.debug("custom_entry_price fallback: %s", e)
+        return proposed_rate
+
+    def adjust_entry_price(self, trade: Trade, order: dict, pair: str, current_time: datetime,
+                           proposed_rate: float, current_order_rate: float, entry_tag: str,
+                           side: str, **kwargs) -> float:
+        try:
+            if (current_time - trade.open_date_utc).total_seconds() > 60:
+                ob = self.dp.market_to_orderbook(pair, 1) if self.dp else None
+                if ob and ob.get("bids"):
+                    return ob["bids"][0][0]
+        except Exception as e:
+            log.debug("adjust_entry_price fallback: %s", e)
+        return current_order_rate
+
+    def custom_exit_price(self, pair: str, trade: Trade, current_time: datetime,
+                          proposed_rate: float, entry_tag: str, side: str,
+                          **kwargs) -> float:
+        try:
+            ob = self.dp.market_to_orderbook(pair, 1) if self.dp else None
+            if ob and ob.get("asks") and ob.get("bids"):
+                bid, ask = ob["bids"][0][0], ob["asks"][0][0]
+                return ask - (ask - bid) * 0.10
+        except Exception as e:
+            log.debug("custom_exit_price fallback: %s", e)
+        return proposed_rate
+
+    # ---- Kelly sizing (fractional, calibrated, clamped) ----
+
+    def custom_stake_amount(self, pair: str, current_time: datetime, current_rate: float,
+                            proposed_stake: float, min_stake: float | None,
+                            max_stake: float, leverage: float, entry_tag: str | None,
+                            side: str, **kwargs) -> float:
+        try:
+            p = float(self.kelly_p)
+            b = float(self.kelly_b) or 1.0
+            lam = float(self.kelly_lambda)
+            f_star = lam * (p - (1 - p) / b)
+            if f_star <= 0:
+                return proposed_stake
+            try:
+                wallet = float(self.wallets.get_available_stake_amount())
+            except Exception:
+                wallet = 0.0
+            if wallet <= 0:
+                return proposed_stake
+            stake = wallet * f_star
+            lo = max(float(self.kelly_min_stake), float(min_stake or 0))
+            return max(lo, min(stake, float(self.kelly_max_stake), float(max_stake or stake)))
+        except Exception as e:
+            log.debug("custom_stake_amount fallback: %s", e)
+            return proposed_stake
+
+    # ---- Groq veto (fail-open, cached, versioned) ----
 
     def confirm_trade_entry(self, pair: str, order_type: str, amount: float, rate: float,
-                            time_in_force: str, current_time, entry_tag: str | None,
+                            time_in_force: str, current_time: datetime, entry_tag: str | None,
                             side: str, **kwargs) -> bool:
-        # TODO (veto wiring): build prompt from entry_tag snapshot + indicator
-        # values, call Groq with HARD timeout (2-3s), fail-OPEN on error/timeout,
-        # cache verdict per signal hash. Return False only on explicit veto.
-        # Secrets: GROQ_API_KEY from Render env, never committed.
-        return True
+        try:
+            key = os.getenv("GROQ_API_KEY", "")
+            if not key:
+                return True  # no key configured (local/backtest): approve silently
+            model = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+            try:
+                signal_data = json.loads(entry_tag) if entry_tag else {}
+            except Exception:
+                signal_data = {}
+            cache_key = (pair, json.dumps(signal_data, sort_keys=True, default=str))
+            if cache_key in self._veto_cache:
+                return self._veto_cache[cache_key]
+            prompt_content = {
+                "prompt_version": VETO_PROMPT_VERSION,
+                "pair": pair,
+                "confluence_score": signal_data.get("score", 0),
+                "z_score": signal_data.get("z", 0.0),
+                "gk_volatility": signal_data.get("gk", 0.0),
+            }
+            r = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                json={
+                    "model": model,
+                    "messages": [
+                        {"role": "system",
+                         "content": "You are a quant trade validator. Respond ONLY "
+                                    "with single character '1' (approve) or '0' (veto)."},
+                        {"role": "user", "content": json.dumps(prompt_content)},
+                    ],
+                    "max_tokens": 1,
+                    "temperature": 0.0,
+                },
+                headers={"Authorization": f"Bearer {key}",
+                         "Content-Type": "application/json"},
+                timeout=float(self.veto_timeout_s),
+            )
+            verdict = True
+            if r.status_code == 200:
+                out = (r.json()["choices"][0]["message"]["content"] or "").strip()
+                verdict = not out.startswith("0")
+            if len(self._veto_cache) >= VETO_CACHE_MAX:
+                self._veto_cache.clear()
+            self._veto_cache[cache_key] = verdict
+            return verdict
+        except Exception as e:
+            log.debug("veto fail-open (%s) [%s]", e, VETO_PROMPT_VERSION)
+            return True
 
-    # ---- ATR stop frozen at entry (Neon risk sizing port) ----
+    # ---- Garman-Klass stop frozen at entry ----
 
     def custom_stoploss(self, pair: str, trade, current_time,
                         current_rate: float, current_profit: float, **kwargs) -> float:
         try:
-            store = trade.custom_data
-            frozen_atr = store.get("entry_atr") if hasattr(store, "get") else None
-            if frozen_atr is None:
-                # first call for this trade: freeze from kwargs/current context
-                frozen_atr = float(kwargs.get("atr_at_entry") or 0) or None
-            if frozen_atr:
-                if hasattr(store, "__setitem__"):
-                    store["entry_atr"] = frozen_atr
-                stop_dist = frozen_atr * 1.5 / max(trade.open_rate, 1e-9)
-                return max(-0.25, min(-0.01, -stop_dist))
+            gk = None
+            try:
+                tag = json.loads(trade.enter_tag) if getattr(trade, "enter_tag", None) else {}
+                gk = float(tag.get("gk")) if tag.get("gk") is not None else None
+            except Exception:
+                gk = None
+            if gk and gk > 0:
+                stop_dist = float(self.gk_stop_mult) * gk
+                return max(-0.25, min(-0.005, -stop_dist))
         except Exception as e:
             log.debug("custom_stoploss fallback: %s", e)
         return self.stoploss
