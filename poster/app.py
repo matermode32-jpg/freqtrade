@@ -106,6 +106,78 @@ def telegram_send(text: str) -> tuple[bool, str]:
         return False, str(e)[:200]
 
 
+# ---- chart path: fetch public klines, render, sendPhoto (text fallback) ----
+
+_KRAKEN_ALIAS = {"BTC": "XBT", "DOGE": "DOGE", "USDT": "USDT"}
+
+
+def _kraken_pair(pair: str) -> str | None:
+    """'BTC/USDT' -> 'XBTUSDT'. None when unmappable (e.g. TEST pairs)."""
+    try:
+        base, quote = pair.upper().split("/")
+        base = _KRAKEN_ALIAS.get(base, base)
+        return base + quote
+    except Exception:
+        return None
+
+
+def fetch_closes(pair: str, limit: int = 100) -> tuple[list[float], float | None]:
+    """Public Kraken klines, no key. Returns (closes, entry-agnostic)."""
+    kp = _kraken_pair(pair)
+    if not kp:
+        raise ValueError("unmappable pair")
+    url = ("https://api.kraken.com/0/public/OHLC?pair=%s&interval=5"
+           % urllib.parse.quote(kp))
+    req = urllib.request.Request(url, method="GET")
+    with urllib.request.urlopen(req, timeout=15) as r:
+        body = json.loads(r.read().decode("utf-8", "replace"))
+    if body.get("error"):
+        raise ValueError(str(body["error"])[:120])
+    result = body.get("result", {})
+    key = next((k for k in result.keys() if k != "last"), None)
+    candles = result.get(key, []) if key else []
+    closes = [float(c[4]) for c in candles[-limit:] if len(c) > 4]
+    if len(closes) < 20:
+        raise ValueError("too few candles")
+    return closes, None
+
+
+def render_chart(closes: list[float], entry_rate: float | None,
+                 title: str, out_path: str = "/tmp/chart.png") -> str:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.plot(closes, label="close 5m")
+    if entry_rate:
+        ax.axhline(entry_rate, linestyle="--", label="entry")
+    ax.set_title(title + " (paper)")
+    ax.legend()
+    fig.savefig(out_path, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+def telegram_send_photo(photo_path: str, caption: str) -> tuple[bool, str]:
+    import requests as _rq
+    token = _env("CHANNEL_BOT_TOKEN")
+    chat_id = _env("CHANNEL_ID")
+    if not token or not chat_id:
+        return False, "missing CHANNEL_BOT_TOKEN/CHANNEL_ID"
+    try:
+        with open(photo_path, "rb") as f:
+            r = _rq.post("https://api.telegram.org/bot%s/sendPhoto" % token,
+                         data={"chat_id": chat_id, "caption": caption},
+                         files={"photo": ("chart.png", f, "image/png")},
+                         timeout=30)
+        body = r.json() if hasattr(r, "json") else {}
+        if r.status_code == 200 and body.get("ok"):
+            return True, str((body.get("result") or {}).get("message_id", ""))
+        return False, str(body)[:200]
+    except Exception as e:
+        return False, str(e)[:200]
+
+
 def binance_square_send(_text: str) -> tuple[bool, str]:
     """UNWIRED STUB. Do not call until Square API is specified + key issued.
     Guarded by ENABLE_BINANCE_SQUARE=true (default false)."""
@@ -131,6 +203,29 @@ def handle_hook(payload: dict) -> dict:
         text = compose_caption(event, payload)
     except AssertionError as e:
         return {"status": "refused", "error": str(e)}
+    # photo first (chart), text fallback — chart needs public klines only
+    photo_status = "no_chart"
+    try:
+        closes, _ = fetch_closes(str(payload.get("pair", "")))
+        try:
+            entry_rate = float(payload.get("rate") or 0) or None
+        except Exception:
+            entry_rate = None
+        photo = render_chart(closes, entry_rate, "%s %s" % (
+            payload.get("pair", "?"), payload.get("direction", "")))
+        photo_status = "chart_ok"
+        ok, info = telegram_send_photo(photo, text)
+        if ok:
+            _log_post({"day": day, "event": event, "status": "posted",
+                       "kind": "photo", "pair": payload.get("pair"), "info": info})
+            result = {"status": "posted", "kind": "photo", "info": info}
+            if True:
+                _, sq = binance_square_send(text)
+                result["square"] = sq
+            return result
+    except Exception as e:
+        photo_status = str(e)[:120]
+        log.info("chart skipped (%s), text fallback", photo_status)
     ok, info = telegram_send(text)
     _log_post({"day": day, "event": event,
                "status": "posted" if ok else "failed",
