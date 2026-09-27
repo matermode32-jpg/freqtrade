@@ -116,24 +116,54 @@ def passes_gate(result: str, pnl: float) -> tuple[bool, str]:
 
 # ---- Fix 3: real freqtrade exit_reason -> result/reason ----
 
-EXIT_MAP = {
-    "roi": ("win", "ROI target reached"),
-    "exit_signal": (None, "exit signal fired"),       # sign decides below
-    "stop_loss": ("loss", "stop hit"),
-    "trailing_stop_loss": ("loss", "trailing stop hit"),
-    "force_exit": (None, "manual exit"),
-    "emergency_exit": (None, "emergency exit"),
-    "timeout_96": (None, "8h timeout, no target"),    # our custom_exit id
+# Source of truth: freqtrade.enums.ExitType
+# ('', custom_exit, emergency_exit, exit_signal, force_exit, liquidation,
+#  partial_exit, roi, sold_on_exchange, stop_loss, stoploss_on_exchange,
+#  trailing_stop_loss) PLUS custom strings (our 'timeout_96') PLUS
+# comma-compounds (freqtradebot appends: exit_reason + ", " + reason).
+_EXIT_LOSS = {"stop_loss": "stop hit",
+              "trailing_stop_loss": "trailing stop hit",
+              "stoploss_on_exchange": "exchange stop hit",
+              "liquidation": "liquidated"}
+_EXIT_LABEL = {
+    "roi": "ROI target reached",
+    "exit_signal": "exit signal fired",
+    "force_exit": "manual exit",
+    "emergency_exit": "emergency exit",
+    "custom_exit": "custom exit",
+    "sold_on_exchange": "sold on exchange",
+    "partial_exit": "partial exit",
+    "timeout_96": "8h timeout, no target",
+    "": "exit",
 }
 
 
 def normalize_exit(exit_reason: str, pnl: float) -> dict:
-    base_result, reason = EXIT_MAP.get(
-        str(exit_reason or ""), (None, str(exit_reason or "exit")))
-    if base_result is None:
-        base_result = "win" if pnl > 0 else "loss"
+    parts = [p.strip() for p in str(exit_reason or "").split(",") if p.strip()]
+    labels: list[str] = []
+    hard_loss = False
+    saw_roi = False
+    for part in parts:
+        if part in _EXIT_LOSS:
+            hard_loss = True
+            labels.append(_EXIT_LOSS[part])
+        elif part == "roi":
+            saw_roi = True
+            labels.append(_EXIT_LABEL[part])
+        elif part in _EXIT_LABEL:
+            labels.append(_EXIT_LABEL[part])
+        else:
+            log.warning("poster: unmapped exit-reason part %r", part)
+            labels.append(part)
+    if hard_loss:
+        result = "loss"
+    elif saw_roi:
+        result = "win"
+    else:
+        result = "win" if pnl > 0 else "loss"
     r_multiple = round(pnl / STOP_PCT, 3)
-    return {"result": base_result, "reason_text": reason,
+    return {"result": result,
+            "reason_text": " + ".join(labels) if labels else "exit",
             "r_multiple": r_multiple}
 
 
@@ -442,7 +472,10 @@ def render_chart(ohlc: list, snap: dict, out_path: str = "/tmp/chart.png") -> st
 # ---- paths: entry-elite + outcome volume ----
 
 def handle_fill(payload: dict) -> dict:
-    """Entry path: elite-only (calibrated PUBLIC_MIN_SCORE), staleness clock."""
+    """Entry path: elite-only (calibrated PUBLIC_MIN_SCORE), staleness clock.
+    NOTE: no veto check here on purpose - vetoed trades never fill, so every
+    fill reaching this function was already approved by confirm_trade_entry in
+    the trader. Do not add a veto path at this layer; it would be dead code."""
     if _tag_score(payload) < int(_env("PUBLIC_MIN_SCORE", "70")):
         return {"status": "skipped_policy"}
     snap = enrich_snapshot("entry_fill", payload, None)
