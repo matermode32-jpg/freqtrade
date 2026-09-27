@@ -386,86 +386,215 @@ def fetch_ohlc(pair: str, limit: int = 130) -> list:
     return out
 
 
+def _ema50(values: list[float], period: int = 50) -> list[float]:
+    """Pure-python EMA (poster image has no talib/pandas - and must not gain
+    them for one line). Callers: pass the REAL 50-period series; an old demo
+    once passed EMA10 mislabeled as EMA50 - do not repeat that."""
+    out: list[float] = []
+    k = 2 / (period + 1)
+    s = values[0] if values else 0.0
+    for v in values:
+        s = v * k + s * (1 - k)
+        out.append(s)
+    return out
+
+
 def render_chart(ohlc: list, snap: dict, out_path: str = "/tmp/chart.png") -> str:
-    """1200x675 candlesticks, last ~10h. Y-axis fits CANDLES (padded);
-    target/stop draw only inside the view, else edge arrows. (Old version let
-    the fixed +/-10% bands squash everything flat, and 300 bars were mush.)
-    Overlays ONLY for conditions_fired (<=3): trend->EMA50, volume->bars."""
+    """AQVION high-quality render: supersampled 2x, Lanczos downscale to
+    exactly 1200x675. Header (brand + direction badge), candlesticks with
+    time axis, risk gauge (TP/entry/SL/current + honest R:R), footer facts.
+    Overlays ONLY for conditions_fired (trend->EMA50, volume->bars)."""
+    import io
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    import matplotlib.patches as patches
+    import matplotlib.dates as mdates
+    from matplotlib.patches import Rectangle, FancyBboxPatch
+    import numpy as np
     from datetime import datetime as _dt
+    from PIL import Image
+
+    BG, PANEL_BG, GRID = "#0a0f1a", "#0d1520", "#182233"
+    TEXT, TEXT_DIM = "#dbe2ec", "#5c6779"
+    ORANGE, GREEN, RED, BLUE = "#f5a623", "#26d6a3", "#f04763", "#4d8fe0"
+    SS = 2
+
+    pair = str(snap.get("coin", "?"))
+    direction = str(snap.get("direction", "long")).upper()
     conds = set(snap.get("conditions_fired", []) or [])
-    times = [_dt.fromtimestamp(c[0], tz=timezone.utc).strftime("%H:%M") for c in ohlc]
-    opens = [c[1] for c in ohlc]
-    highs = [c[2] for c in ohlc]
-    lows = [c[3] for c in ohlc]
-    closes = [c[4] for c in ohlc]
-    vols = [c[5] for c in ohlc]
+    entry = float(snap.get("entry_price") or 0)
+    target = entry * 1.04 if entry else 0.0
+    stop = entry * 0.90 if entry else 0.0
 
-    lo, hi = min(lows), max(highs)
-    pad = (hi - lo) * 0.15 or hi * 0.001
-    lo -= pad
-    hi += pad
+    rows = [(_dt.fromtimestamp(c[0], tz=timezone.utc),
+             float(c[1]), float(c[2]), float(c[3]), float(c[4]))
+            for c in ohlc]
+    closes = [c[4] for c in rows]
+    ema = _ema50(closes, 50)
 
-    fig, ax = plt.subplots(figsize=(12, 6.75), dpi=100)
-    ax.set_facecolor("#0f1115")
-    fig.patch.set_facecolor("#0f1115")
-    for i, (o, h, l, c) in enumerate(zip(opens, highs, lows, closes)):
-        color = "#26a69a" if c >= o else "#ef5350"
-        ax.plot([i, i], [l, h], color=color, linewidth=1.2)
-        ax.add_patch(patches.Rectangle(
-            (i - 0.35, min(o, c)), 0.7, max(abs(c - o), (hi - lo) * 0.0008),
-            facecolor=color, edgecolor=color))
-    n_over = 0
-    if "trend" in conds and n_over < 3:
-        ema, k, s = [], 2 / (50 + 1), closes[0]
-        for v in closes:
-            s = v * k + s * (1 - k)
-            ema.append(s)
-        ax.plot(ema, label="EMA50", linewidth=1.4, color="#e2a63d")
-        n_over += 1
-    entry = snap.get("entry_price") or 0
+    W, H = 12, 6.75
+    dpi = 100 * SS
+    fig = plt.figure(figsize=(W, H), dpi=dpi, facecolor=BG)
+    gs = fig.add_gridspec(3, 2, height_ratios=[0.09, 0.72, 0.19],
+                          width_ratios=[0.87, 0.13],
+                          hspace=0.07, wspace=0.025,
+                          left=0.045, right=0.97, top=0.97, bottom=0.035)
+    ax_head = fig.add_subplot(gs[0, :])
+    ax_head.axis("off")
+    ax_price = fig.add_subplot(gs[1, 0])
+    ax_gauge = fig.add_subplot(gs[1, 1])
+    ax_foot = fig.add_subplot(gs[2, :])
+    ax_foot.axis("off")
+    ax_foot = fig.add_subplot(gs[2, :])
+    ax_foot.axis("off")
+    for ax in (ax_price, ax_gauge):
+        ax.set_facecolor(PANEL_BG)
+        for spine in ax.spines.values():
+            spine.set_color(GRID)
+            spine.set_linewidth(1.1)
+            spine.set_visible(True)
 
-    def _level(price: float, style: str, label: str, color: str) -> None:
-        if not price:
-            return
-        if lo <= price <= hi:
-            ax.axhline(price, linestyle=style, linewidth=1.2, color=color)
-            ax.text(len(ohlc) - 1, price, " %s %s " % (label, _fmt(price)),
-                    color="white", fontsize=9, va="center", ha="right",
-                    bbox=dict(facecolor=color, alpha=0.85, edgecolor="none", pad=1))
-        else:
-            arrow = "$\u2191$" if price > hi else "$\u2193$"
-            ax.annotate("%s %s %s" % (label, arrow, _fmt(price)),
-                        xy=(len(ohlc) - 1, hi if price > hi else lo),
-                        color=color, fontsize=10, ha="right",
-                        va="top" if price > hi else "bottom")
+    ax_head.text(0.0, 0.48, "AQVION", fontsize=23, fontweight="bold",
+                 color=ORANGE, va="center", ha="left")
+    ax_head.text(0.158, 0.48, "%s  \u00b7  5m  \u00b7  paper" % pair,
+                 fontsize=11.5, color=TEXT_DIM, va="center", ha="left")
+    dir_color = GREEN if direction == "LONG" else RED
+    ax_head.add_patch(FancyBboxPatch(
+        (0.905, 0.1), 0.085, 0.8,
+        boxstyle="round,pad=0.006,rounding_size=0.15",
+        transform=ax_head.transAxes, facecolor=dir_color,
+        edgecolor="none", alpha=0.16))
+    ax_head.text(0.9475, 0.5, direction, fontsize=11.5, fontweight="bold",
+                 color=dir_color, va="center", ha="center",
+                 transform=ax_head.transAxes)
 
+    dates = [d for d, *_ in rows]
+    xnum = mdates.date2num(dates)
+    width = (xnum[1] - xnum[0]) * 0.58 if len(xnum) > 1 else 0.0015
+    lows = [row[3] for row in rows]
+    highs = [row[2] for row in rows]
+    minh = max(highs) - min(lows)
+    for i, (d, o, h, l, c) in enumerate(rows):
+        x = xnum[i]
+        up = c >= o
+        color = GREEN if up else RED
+        ax_price.plot([x, x], [l, h], color=color, linewidth=1.15, zorder=2,
+                      solid_capstyle="round", alpha=0.95)
+        body_low, body_high = (o, c) if up else (c, o)
+        body_h = max(body_high - body_low, minh * 0.0018)
+        ax_price.add_patch(Rectangle(
+            (x - width / 2, body_low), width, body_h,
+            facecolor=color, edgecolor=color, linewidth=0,
+            zorder=3, alpha=0.95))
+    if "trend" in conds:
+        ax_price.plot(xnum, ema, color=ORANGE, linewidth=1.6, alpha=0.9,
+                      zorder=4, solid_capstyle="round", label="EMA50")
+        leg = ax_price.legend(loc="upper left", frameon=False, fontsize=9.5)
+        for t in leg.get_texts():
+            t.set_color(TEXT_DIM)
     if entry:
-        _level(entry, "--", "entry", "#4da3ff")
-        _level(entry * 1.04, ":", "target", "#26a69a")
-        _level(entry * 0.90, ":", "stop", "#ef5350")
-    if "volume" in conds and n_over < 3:
-        ax2 = ax.twinx()
-        ax2.bar(range(len(ohlc)), vols, alpha=0.22, color="gray")
-        ax2.set_ylim(0, max(vols) * 4)
-        ax2.tick_params(labelsize=7, colors="gray")
-        n_over += 1
-    step = max(1, len(ohlc) // 6)
-    ax.set_xticks(range(0, len(ohlc), step))
-    ax.set_xticklabels([times[i] for i in range(0, len(ohlc), step)],
-                       fontsize=8, color="gray")
-    ax.set_xlim(-1, len(ohlc))
-    ax.set_ylim(lo, hi)
-    ax.tick_params(labelsize=8, colors="gray")
-    ax.grid(True, alpha=0.15)
-    ax.set_title("%s - 5m (paper)" % snap.get("coin", "?"), loc="left",
-                 color="white", fontsize=12)
-    ax.legend(fontsize=8, facecolor="#0f1115", labelcolor="white")
-    fig.savefig(out_path, bbox_inches="tight", facecolor=fig.get_facecolor())
+        ax_price.axhline(entry, color=BLUE, linestyle=(0, (5, 3)),
+                         linewidth=1.3, alpha=0.9, zorder=5)
+        ax_price.text(xnum[-1], entry, "  entry %s" % _fmt(entry), color=BLUE,
+                      fontsize=9.5, va="center", ha="left", fontweight="bold")
+    ax_price.set_xlim(xnum[0], xnum[-1] + (xnum[-1] - xnum[0]) * 0.115)
+    pad = minh * 0.09
+    ax_price.set_ylim(min(lows) - pad, max(highs) + pad)
+    ax_price.grid(True, color=GRID, linewidth=0.7, alpha=0.55)
+    ax_price.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+    ax_price.yaxis.set_major_formatter(
+        matplotlib.ticker.FuncFormatter(lambda v, p: "%s" % _fmt(v)))
+    ax_price.tick_params(colors=TEXT_DIM, labelsize=9, length=0)
+    ax_price.text(0.012, 0.025, "%s \u00b7 5m" % pair,
+                  transform=ax_price.transAxes,
+                  fontsize=8.5, color=TEXT_DIM, va="bottom", ha="left", alpha=0.8)
+    ax_price.text(0.5, 0.5, "AQVION", transform=ax_price.transAxes,
+                  fontsize=46, color=TEXT_DIM, alpha=0.022, ha="center",
+                  va="center", fontweight="bold", zorder=0)
+
+    is_long = direction == "LONG"
+    gauge_lo, gauge_hi = (stop, target) if is_long else (target, stop)
+    span = gauge_hi - gauge_lo
+    current = closes[-1]
+    ax_gauge.set_xlim(0, 1)
+    ax_gauge.set_ylim(0, 1)
+    ax_gauge.axis("off")
+    bar_x0, bar_w = 0.40, 0.18
+    ax_gauge.add_patch(FancyBboxPatch(
+        (bar_x0, 0.05), bar_w, 0.90,
+        boxstyle="round,pad=0,rounding_size=0.02",
+        facecolor="#101b2b", edgecolor=GRID, linewidth=1.1, zorder=1))
+
+    def y_of(price):
+        return 0.05 + 0.90 * (price - gauge_lo) / span if span else 0.5
+
+    cur_y = float(np.clip(y_of(current), 0.06, 0.94))
+    ax_gauge.add_patch(FancyBboxPatch(
+        (bar_x0, 0.05), bar_w, cur_y - 0.05,
+        boxstyle="round,pad=0,rounding_size=0.02",
+        facecolor=dir_color, alpha=0.28, edgecolor="none", zorder=2))
+
+    def mark(price, label, color, side, y_off):
+        y = float(np.clip(y_of(price), 0.05, 0.95))
+        ax_gauge.plot([bar_x0, bar_x0 + bar_w], [y, y], color=color,
+                      linewidth=2.2, zorder=4, solid_capstyle="round")
+        if side == "right":
+            ax_gauge.text(bar_x0 + bar_w + 0.025, y, label, color=color,
+                          fontsize=9, fontweight="bold", ha="left",
+                          va="center", zorder=5)
+        else:
+            ax_gauge.text(bar_x0 + bar_w / 2, y + y_off, label, color=color,
+                          fontsize=9, fontweight="bold", ha="center",
+                          va="bottom" if y_off > 0 else "top", zorder=5)
+
+    entry_close = abs(y_of(entry) - cur_y) < 0.07 if entry and span else False
+    if target:
+        mark(target, "TP %s" % _fmt(target), GREEN, "top", 0.035)
+    if entry:
+        mark(entry, "E %s" % _fmt(entry), BLUE,
+             "right" if entry_close else "top", 0.0 if entry_close else 0.035)
+    if stop:
+        mark(stop, "SL %s" % _fmt(stop), RED, "bottom", -0.045)
+    ax_gauge.plot(bar_x0 - 0.035, cur_y, marker=">", color=TEXT,
+                  markersize=8, zorder=6)
+    cur_label_y = cur_y - 0.055 if entry_close else cur_y
+    ax_gauge.text(bar_x0 - 0.055, cur_label_y, "%s" % _fmt(current),
+                  color=TEXT, fontsize=9, ha="right", va="center",
+                  fontweight="bold")
+    dist_to_tp = abs(target - current) / current * 100 if current else 0
+    dist_to_sl = abs(current - stop) / current * 100 if current else 0
+    rr = dist_to_tp / dist_to_sl if dist_to_sl else 0
+    ax_gauge.text(0.5, 0.99, "R:R %.2f" % rr, color=TEXT_DIM, fontsize=8.5,
+                  ha="center", va="top", transform=ax_gauge.transAxes)
+
+    if entry and current:
+        dist_line = ("Entry: %s     Target: %s  (+%.2f%%)     Stop: %s  (-%.2f%%)"
+                     "     R:R %.2f" % (
+                         _fmt(entry), _fmt(target), dist_to_tp,
+                         _fmt(stop), dist_to_sl, rr))
+    else:
+        dist_line = "Entry %s" % _fmt(entry)
+    lines = [
+        ("%s | %s (Paper)" % (pair, direction), TEXT, 12.5, "bold"),
+        (dist_line, TEXT, 10.5, "normal"),
+        ("Setup: %s" % ", ".join(snap.get("conditions_fired", [])
+                                 or ["confluence"]), TEXT_DIM, 9.7, "normal"),
+        ("[!] " + DISCLAIMER, TEXT_DIM, 8.3, "normal"),
+    ]
+    y = 0.87
+    for text, color, size, weight in lines:
+        ax_foot.text(0.0, y, text, fontsize=size, color=color,
+                     fontweight=weight, va="top", ha="left",
+                     transform=ax_foot.transAxes)
+        y -= 0.30
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", facecolor=BG, dpi=dpi)
     plt.close(fig)
+    buf.seek(0)
+    from PIL import Image
+    img = Image.open(buf).resize((1200, 675), Image.LANCZOS)
+    img.save(out_path)
     return out_path
 
 
