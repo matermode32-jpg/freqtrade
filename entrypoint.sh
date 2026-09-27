@@ -64,6 +64,16 @@ def main():
     if ex_secret:
         config.setdefault("exchange", {})["secret"] = ex_secret
 
+    # Poster webhook URL (second Render service). Placeholder stays in git;
+    # real URL comes from env, so the poster can be deployed independently.
+    # Until set, the module is disabled: no failed POSTs, no log noise.
+    webhook_url = os.environ.get("WEBHOOK_URL", "")
+    if webhook_url:
+        config.setdefault("webhook", {})["url"] = webhook_url
+        config["webhook"]["enabled"] = True
+    elif "webhook" in config:
+        config["webhook"]["enabled"] = False
+
     with open(CONFIG_DST, "w", encoding="utf-8") as f:
         json.dump(config, f, indent=4)
 
