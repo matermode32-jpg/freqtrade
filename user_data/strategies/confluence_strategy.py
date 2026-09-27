@@ -125,7 +125,7 @@ class ConfluenceStrategy(IStrategy):
     INTERFACE_VERSION = 3
     timeframe = "5m"
     can_short = False
-    minimal_roi = {"60": 0.01, "30": 0.02, "0": 0.04}
+    minimal_roi = {"60": 0.005, "30": 0.008, "0": 0.015}
     stoploss = -0.10
     startup_candle_count = 300
     process_only_new_candles = True
@@ -136,7 +136,7 @@ class ConfluenceStrategy(IStrategy):
 
     # ---- quant knobs (tune gate owns these numbers) ----
     confluence_min_score = 55
-    z_low, z_high = -2.0, 1.5
+    z_low, z_high = -2.0, 0.1
     gk_stop_mult = 6.0
     # Kelly: calibrated from 30d Binance behavior test (31 trades, p=0.774,
     # b=0.450, PF 1.54). Recompute after each validation window.
