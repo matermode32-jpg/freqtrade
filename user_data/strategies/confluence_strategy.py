@@ -136,7 +136,7 @@ class ConfluenceStrategy(IStrategy):
 
     # ---- quant knobs (tune gate owns these numbers) ----
     confluence_min_score = 55
-    z_low, z_high = -2.0, 1.5
+    z_low, z_high = -2.0, 0.1
     gk_stop_mult = 6.0
     # Kelly: calibrated from 30d Binance behavior test (31 trades, p=0.774,
     # b=0.450, PF 1.54). Recompute after each validation window.
