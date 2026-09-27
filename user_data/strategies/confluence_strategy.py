@@ -125,7 +125,7 @@ class ConfluenceStrategy(IStrategy):
     INTERFACE_VERSION = 3
     timeframe = "5m"
     can_short = False
-    minimal_roi = {"60": 0.005, "30": 0.008, "0": 0.015}
+    minimal_roi = {"60": 0.01, "30": 0.02, "0": 0.04}
     stoploss = -0.10
     startup_candle_count = 300
     process_only_new_candles = True
